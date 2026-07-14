@@ -949,6 +949,9 @@ static void split_central_device_found(const bt_addr_le_t *addr, int8_t rssi, ui
     }
 }
 
+static void scan_retry_cb(struct k_work *work) { start_scanning(); }
+static K_WORK_DELAYABLE_DEFINE(scan_retry_work, scan_retry_cb);
+
 static int start_scanning(void) {
     if (!is_enabled) {
         LOG_DBG("Not scanning, we're disabled");
@@ -974,13 +977,16 @@ static int start_scanning(void) {
         return 0;
     }
 
-    // Start scanning otherwise.
-    is_scanning = true;
+    // Start scanning otherwise. Mark is_scanning only on success: a stuck-true flag
+    // after a transient failure makes every later call a no-op and the central stays
+    // scan-dead until reboot. Retry so a transient controller-busy error self-heals.
     int err = bt_le_scan_start(BT_LE_SCAN_PASSIVE, split_central_device_found);
-    if (err < 0) {
-        LOG_ERR("Scanning failed to start (err %d)", err);
+    if (err < 0 && err != -EALREADY) {
+        LOG_ERR("Scanning failed to start (err %d), retrying in 1s", err);
+        k_work_schedule(&scan_retry_work, K_SECONDS(1));
         return err;
     }
+    is_scanning = true;
 
     LOG_DBG("Scanning successfully started");
     return 0;

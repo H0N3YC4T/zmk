@@ -1047,6 +1047,13 @@ static void split_central_disconnected(struct bt_conn *conn, uint8_t reason) {
 
     k_work_submit(&notify_status_work);
 
+    // Restart (not just resume) scanning: if this peripheral rebooted and advertised
+    // before this disconnect fired, the scan duplicate filter has already consumed its
+    // address for the current session and it stays invisible until a new session
+    // resets the filter.
+    if (is_scanning) {
+        stop_scanning();
+    }
     start_scanning();
 }
 

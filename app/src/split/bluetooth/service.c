@@ -178,6 +178,18 @@ ssize_t bt_gatt_attr_read_input_split_cpf(struct bt_conn *conn, const struct bt_
 
 #endif
 
+#if IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING)
+static uint8_t charging_state;
+
+static ssize_t split_svc_charging_state(struct bt_conn *conn, const struct bt_gatt_attr *attrs,
+                                        void *buf, uint16_t len, uint16_t offset) {
+    return bt_gatt_attr_read(conn, attrs, buf, len, offset, &charging_state,
+                             sizeof(charging_state));
+}
+
+static void split_svc_charging_state_ccc(const struct bt_gatt_attr *attr, uint16_t value) {}
+#endif /* IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING) */
+
 BT_GATT_SERVICE_DEFINE(
     split_svc, BT_GATT_PRIMARY_SERVICE(BT_UUID_DECLARE_128(ZMK_SPLIT_BT_SERVICE_UUID)),
     BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_128(ZMK_SPLIT_BT_CHAR_POSITION_STATE_UUID),
@@ -201,6 +213,12 @@ BT_GATT_SERVICE_DEFINE(
                                BT_GATT_CHRC_WRITE_WITHOUT_RESP, BT_GATT_PERM_WRITE_ENCRYPT, NULL,
                                split_svc_update_indicators, NULL),
 #endif // IS_ENABLED(CONFIG_ZMK_SPLIT_PERIPHERAL_HID_INDICATORS)
+#if IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING)
+    BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_128(ZMK_SPLIT_BT_CHAR_CHARGING_STATE_UUID),
+                           BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY, BT_GATT_PERM_READ_ENCRYPT,
+                           split_svc_charging_state, NULL, &charging_state),
+    BT_GATT_CCC(split_svc_charging_state_ccc, BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT),
+#endif /* IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING) */
     BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_128(ZMK_SPLIT_BT_SELECT_PHYS_LAYOUT_UUID),
                            BT_GATT_CHRC_WRITE | BT_GATT_CHRC_READ,
                            BT_GATT_PERM_WRITE_ENCRYPT | BT_GATT_PERM_READ_ENCRYPT,
@@ -435,3 +453,22 @@ static ssize_t split_svc_run_behavior(struct bt_conn *conn, const struct bt_gatt
 
     return len;
 }
+#if IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING) && IS_ENABLED(CONFIG_USB_DEVICE_STACK)
+
+#include <zmk/event_manager.h>
+#include <zmk/events/battery_state_changed.h>
+#include <zmk/events/usb_conn_state_changed.h>
+#include <zmk/usb.h>
+
+static int charging_state_listener(const zmk_event_t *eh) {
+    charging_state = zmk_usb_is_powered() ? 1 : 0;
+    bt_gatt_notify_uuid(NULL, BT_UUID_DECLARE_128(ZMK_SPLIT_BT_CHAR_CHARGING_STATE_UUID),
+                        split_svc.attrs, &charging_state, sizeof(charging_state));
+    return ZMK_EV_EVENT_BUBBLE;
+}
+
+ZMK_LISTENER(split_charging_state, charging_state_listener);
+ZMK_SUBSCRIPTION(split_charging_state, zmk_usb_conn_state_changed);
+ZMK_SUBSCRIPTION(split_charging_state, zmk_battery_state_changed);
+
+#endif /* CONFIG_ZMK_BATTERY_REPORTING && CONFIG_USB_DEVICE_STACK */

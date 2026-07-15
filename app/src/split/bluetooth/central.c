@@ -58,6 +58,10 @@ struct peripheral_slot {
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING)
     struct bt_gatt_subscribe_params batt_lvl_subscribe_params;
     struct bt_gatt_read_params batt_lvl_read_params;
+    struct bt_gatt_subscribe_params charging_subscribe_params;
+    struct bt_gatt_discover_params charging_sub_discover_params;
+    uint8_t last_battery_level;
+    uint8_t charging;
     // See sensor_sub_discover_params above.
     struct bt_gatt_discover_params batt_lvl_sub_discover_params;
 #endif /* IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING) */
@@ -226,6 +230,10 @@ int release_peripheral_slot(int index) {
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING)
     slot->batt_lvl_subscribe_params.value_handle = 0;
     slot->batt_lvl_subscribe_params.ccc_handle = 0;
+    slot->charging_subscribe_params.value_handle = 0;
+    slot->charging_subscribe_params.ccc_handle = 0;
+    slot->last_battery_level = 0;
+    slot->charging = 0;
 #endif /* IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING) */
     slot->run_behavior_handle = 0;
     slot->selected_physical_layout_handle = 0;
@@ -431,11 +439,16 @@ static uint8_t split_central_battery_level_notify_func(struct bt_conn *conn,
     uint8_t battery_level = ((uint8_t *)data)[0];
     LOG_DBG("Battery level: %u", battery_level);
 
+    struct peripheral_slot *pslot = peripheral_slot_for_conn(conn);
+    if (pslot) {
+        pslot->last_battery_level = battery_level;
+    }
     struct peripheral_event_wrapper ev = {
         .source = peripheral_slot_index_for_conn(conn),
         .event = {.type = ZMK_SPLIT_TRANSPORT_PERIPHERAL_EVENT_TYPE_BATTERY_EVENT,
                   .data = {.battery_event = {
                                .level = battery_level,
+                               .charging = pslot ? pslot->charging : 0,
                            }}}};
 
     k_msgq_put(&peripheral_event_msgq, &ev, K_NO_WAIT);
@@ -475,11 +488,43 @@ static uint8_t split_central_battery_level_read_func(struct bt_conn *conn, uint8
 
     LOG_DBG("Battery level: %u", battery_level);
 
+    struct peripheral_slot *pslot = peripheral_slot_for_conn(conn);
+    if (pslot) {
+        pslot->last_battery_level = battery_level;
+    }
     struct peripheral_event_wrapper ev = {
         .source = peripheral_slot_index_for_conn(conn),
         .event = {.type = ZMK_SPLIT_TRANSPORT_PERIPHERAL_EVENT_TYPE_BATTERY_EVENT,
                   .data = {.battery_event = {
                                .level = battery_level,
+                               .charging = pslot ? pslot->charging : 0,
+                           }}}};
+
+    k_msgq_put(&peripheral_event_msgq, &ev, K_NO_WAIT);
+    k_work_submit(&peripheral_event_work);
+
+    return BT_GATT_ITER_CONTINUE;
+}
+
+static uint8_t split_central_charging_notify_func(struct bt_conn *conn,
+                                                  struct bt_gatt_subscribe_params *params,
+                                                  const void *data, uint16_t length) {
+    if (!data) {
+        params->value_handle = 0U;
+        return BT_GATT_ITER_STOP;
+    }
+    struct peripheral_slot *slot = peripheral_slot_for_conn(conn);
+    if (slot == NULL || length < 1) {
+        return BT_GATT_ITER_CONTINUE;
+    }
+    slot->charging = ((const uint8_t *)data)[0] ? 1 : 0;
+
+    struct peripheral_event_wrapper ev = {
+        .source = peripheral_slot_index_for_conn(conn),
+        .event = {.type = ZMK_SPLIT_TRANSPORT_PERIPHERAL_EVENT_TYPE_BATTERY_EVENT,
+                  .data = {.battery_event = {
+                               .level = slot->last_battery_level,
+                               .charging = slot->charging,
                            }}}};
 
     k_msgq_put(&peripheral_event_msgq, &ev, K_NO_WAIT);
@@ -587,6 +632,9 @@ static void split_central_flush_subscriptions(struct bt_conn *conn, struct perip
         split_central_subscribe(conn, &slot->batt_lvl_subscribe_params);
         bt_gatt_read(conn, &slot->batt_lvl_read_params);
     }
+    if (slot->charging_subscribe_params.value_handle) {
+        split_central_subscribe(conn, &slot->charging_subscribe_params);
+    }
 #endif /* IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING) */
 }
 
@@ -687,6 +735,14 @@ static uint8_t split_central_chrc_discovery_func(struct bt_conn *conn,
             slot->update_hid_indicators = bt_gatt_attr_value_handle(attr);
 #endif // IS_ENABLED(CONFIG_ZMK_SPLIT_PERIPHERAL_HID_INDICATORS)
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING)
+        } else if (!bt_uuid_cmp(((struct bt_gatt_chrc *)attr->user_data)->uuid,
+                                BT_UUID_DECLARE_128(ZMK_SPLIT_BT_CHAR_CHARGING_STATE_UUID))) {
+            LOG_DBG("Found charging state characteristic");
+            slot->charging_subscribe_params.disc_params = &slot->charging_sub_discover_params;
+            slot->charging_subscribe_params.end_handle = slot->discover_params.end_handle;
+            slot->charging_subscribe_params.value_handle = bt_gatt_attr_value_handle(attr);
+            slot->charging_subscribe_params.notify = split_central_charging_notify_func;
+            slot->charging_subscribe_params.value = BT_GATT_CCC_NOTIFY;
         } else if (!bt_uuid_cmp(((struct bt_gatt_chrc *)attr->user_data)->uuid,
                                 BT_UUID_BAS_BATTERY_LEVEL)) {
             LOG_DBG("Found battery level characteristics");

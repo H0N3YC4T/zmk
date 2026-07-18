@@ -1048,6 +1048,14 @@ static int start_scanning(void) {
     return 0;
 }
 
+static void restart_scanning_cb(struct k_work *work) {
+    if (is_scanning) {
+        stop_scanning();
+    }
+    start_scanning();
+}
+static K_WORK_DEFINE(restart_scanning_work, restart_scanning_cb);
+
 static void split_central_connected(struct bt_conn *conn, uint8_t conn_err) {
     char addr[BT_ADDR_LE_STR_LEN];
     struct bt_conn_info info;
@@ -1109,14 +1117,11 @@ static void split_central_disconnected(struct bt_conn *conn, uint8_t reason) {
 
     k_work_submit(&notify_status_work);
 
-    // Restart (not just resume) scanning: if this peripheral rebooted and advertised
-    // before this disconnect fired, the scan duplicate filter has already consumed its
-    // address for the current session and it stays invisible until a new session
-    // resets the filter.
-    if (is_scanning) {
-        stop_scanning();
-    }
-    start_scanning();
+    // Restart (not just resume) scanning so the duplicate filter forgets a peripheral
+    // that advertised before this disconnect fired. Deferred to the workqueue: the
+    // stop/start pair blocks on HCI responses, which must not happen in the
+    // connection-callback context.
+    k_work_submit(&restart_scanning_work);
 }
 
 static void split_central_security_changed(struct bt_conn *conn, bt_security_t level,

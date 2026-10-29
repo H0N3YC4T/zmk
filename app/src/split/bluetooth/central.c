@@ -487,8 +487,15 @@ static int split_central_subscribe(struct bt_conn *conn, struct bt_gatt_subscrib
     case 0:
         LOG_DBG("[SUBSCRIBED]");
         break;
+    case -EBUSY:
+        LOG_ERR("Subscribe failed (err %d)", err);
+        break; // a CCC discovery is still in flight on these params
     default:
         LOG_ERR("Subscribe failed (err %d)", err);
+        // Zephyr leaves func set if the CCC discovery fails to send, so every retry gets -EBUSY.
+        if (params->disc_params != NULL) {
+            params->disc_params->func = NULL;
+        }
         break;
     }
 

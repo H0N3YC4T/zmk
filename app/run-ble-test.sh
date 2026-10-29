@@ -58,10 +58,26 @@ fi
 testcase="$path"
 echo "Running $testcase:"
 
+# Optional per-test overrides, one argument per line
+central_cmake_args=""
+if [ -f $testcase/central.cmake-args ]; then
+    central_cmake_args=$(tr '\n' ' ' < $testcase/central.cmake-args)
+fi
+
+peripheral_cmake_args=""
+if [ -f $testcase/peripheral.cmake-args ]; then
+    peripheral_cmake_args=$(tr '\n' ' ' < $testcase/peripheral.cmake-args)
+fi
+
+sim_length=50e6
+if [ -f $testcase/sim-length ]; then
+    sim_length=$(tr -d ' \n' < $testcase/sim-length)
+fi
+
 shopt -s nullglob
 for file in $(pwd)/$testcase/peripheral*.overlay ; do
     pn=$(basename -s .overlay ${file})
-    west build -d build/${testcase%%/}_${pn}/ -b nrf52_bsim//zmk_test_mock -- -DZMK_CONFIG="$(pwd)/$testcase" -DEXTRA_DTC_OVERLAY_FILE="${file}" > /dev/null 2>&1
+    west build -d build/${testcase%%/}_${pn}/ -b nrf52_bsim//zmk_test_mock -- -DZMK_CONFIG="$(pwd)/$testcase" -DEXTRA_DTC_OVERLAY_FILE="${file}" ${peripheral_cmake_args} > /dev/null 2>&1
 
     if [ $? -gt 0 ]; then
         echo "FAILED: $testcase peripheral ${pn} did not build" | tee -a ./build/tests/pass-fail.log
@@ -76,7 +92,7 @@ if ls $(pwd)/$testcase/peripheral*.overlay >/dev/null 2>&1; then
     extra_cmake_args="-DCONFIG_ZMK_SPLIT_ROLE_CENTRAL=y"
 fi
 
-west build -d build/$testcase -b nrf52_bsim//zmk_test_mock -- -DZMK_CONFIG="$(pwd)/$testcase" ${extra_cmake_args} > /dev/null 2>&1
+west build -d build/$testcase -b nrf52_bsim//zmk_test_mock -- -DZMK_CONFIG="$(pwd)/$testcase" ${extra_cmake_args} ${central_cmake_args} > /dev/null 2>&1
 if [ $? -gt 0 ]; then
     echo "FAILED: $testcase did not build" | tee -a ./build/tests/pass-fail.log
     exit 1
@@ -117,7 +133,7 @@ do
   ${line} -s=${exe_name} | tee -a "${start_dir}/build/$testcase/output.log" > "${output_dev}" &
 done
 
-./bs_2G4_phy_v1 -s=${exe_name} -D=$(( 2 + sibling_counts )) -sim_length=50e6 > "${output_dev}" 2>&1
+./bs_2G4_phy_v1 -s=${exe_name} -D=$(( 2 + sibling_counts )) -sim_length=${sim_length} > "${output_dev}" 2>&1
 
 popd > /dev/null 2>&1
 

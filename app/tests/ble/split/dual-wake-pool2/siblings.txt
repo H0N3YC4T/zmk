@@ -1,0 +1,3 @@
+./ble_test_central.exe -d=2 -rs=18
+./tests_ble_split_dual-wake-pool2_peripheral1.exe -d=3 -rs=19 -start_offset=400000 -delay_init
+./tests_ble_split_dual-wake-pool2_peripheral2.exe -d=4 -rs=20 -start_offset=100000 -delay_init

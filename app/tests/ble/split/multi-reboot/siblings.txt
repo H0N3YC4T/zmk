@@ -1,0 +1,7 @@
+./ble_test_central.exe -d=2 -rs=18
+./tests_ble_split_multi-reboot_peripheral.exe -d=3 -rs=19 -flash=/tmp/zmk_ble_split_multi-reboot.flash -flash_erase
+./tests_ble_split_multi-reboot_peripheral.exe -d=4 -rs=19 -flash=/tmp/zmk_ble_split_multi-reboot.flash -start_offset=15021092 -delay_init
+./tests_ble_split_multi-reboot_peripheral.exe -d=5 -rs=19 -flash=/tmp/zmk_ble_split_multi-reboot.flash -start_offset=30029834 -delay_init
+./tests_ble_split_multi-reboot_peripheral.exe -d=6 -rs=19 -flash=/tmp/zmk_ble_split_multi-reboot.flash -start_offset=45027903 -delay_init
+./tests_ble_split_multi-reboot_peripheral.exe -d=7 -rs=19 -flash=/tmp/zmk_ble_split_multi-reboot.flash -start_offset=60016877 -delay_init
+./tests_ble_split_multi-reboot_peripheral.exe -d=8 -rs=19 -flash=/tmp/zmk_ble_split_multi-reboot.flash -start_offset=75029323 -delay_init

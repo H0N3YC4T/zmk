@@ -1,0 +1,20 @@
+
+#include <dt-bindings/zmk/kscan_mock.h>
+
+#include "shared.dtsi"
+
+/* same identity + bond as A (same -rs, shared flash), boots at ~14.7s inside the stale-link window */
+&kscan {
+    events =
+    <ZMK_MOCK_RELEASE(0,0,7000)
+    ZMK_MOCK_PRESS(0,1,200)
+    ZMK_MOCK_RELEASE(0,1,2000)>;
+};
+
+&mock_encoder {
+    status = "okay";
+
+    event-startup-delay = <19000>;
+    event-period = <2000>;
+    events = <18 (-18)>;
+};

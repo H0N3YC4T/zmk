@@ -980,6 +980,10 @@ static void split_central_disconnected(struct bt_conn *conn, uint8_t reason) {
 
     k_work_submit(&notify_status_work);
 
+    // Restart rather than just start: only a restart resets the scan's duplicate filter.
+    if (is_scanning) {
+        stop_scanning();
+    }
     start_scanning();
 }
 

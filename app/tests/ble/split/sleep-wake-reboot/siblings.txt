@@ -1,0 +1,3 @@
+./ble_test_central.exe -d=2 -rs=18
+./tests_ble_split_sleep-wake-reboot_peripheral_a.exe -d=3 -rs=19 -flash=/tmp/zmk_ble_split_sleep-wake-reboot.flash -flash_erase
+./tests_ble_split_sleep-wake-reboot_peripheral_b.exe -d=4 -rs=19 -flash=/tmp/zmk_ble_split_sleep-wake-reboot.flash -start_offset=14742200 -delay_init

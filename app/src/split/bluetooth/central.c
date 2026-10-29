@@ -62,6 +62,11 @@ struct peripheral_slot {
     uint16_t selected_physical_layout_handle;
     uint8_t position_state[POSITION_STATE_DATA_LEN];
     uint8_t changed_positions[POSITION_STATE_DATA_LEN];
+    // Post-discovery subscribe chain: one CCC discovery or write in flight per peripheral.
+    struct bt_gatt_subscribe_params *sub_chain_pending;
+    struct k_work_delayable sub_chain_retry_work;
+    uint8_t sub_chain_index;
+    uint8_t sub_chain_retries;
 };
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_SPLIT)
@@ -98,6 +103,7 @@ static int reserve_next_open_input_slot(struct peripheral_input_slot **slot, str
             // Clear out any previously set values
             peripheral_input_slots[i].sub.value_handle = 0;
             peripheral_input_slots[i].sub.ccc_handle = 0;
+            peripheral_input_slots[i].sub.notify = NULL;
             peripheral_input_slots[i].reg = 0;
             *slot = &peripheral_input_slots[i];
             return i;
@@ -214,11 +220,20 @@ int release_peripheral_slot(int index) {
 
     // Clean up previously discovered handles;
     slot->subscribe_params.value_handle = 0;
+    // The chain skips any characteristic this link's discovery did not find again.
+    slot->sensor_subscribe_params.value_handle = 0;
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING)
+    slot->batt_lvl_subscribe_params.value_handle = 0;
+#endif /* IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING) */
     slot->run_behavior_handle = 0;
     slot->selected_physical_layout_handle = 0;
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_PERIPHERAL_HID_INDICATORS)
     slot->update_hid_indicators = 0;
 #endif // IS_ENABLED(CONFIG_ZMK_SPLIT_PERIPHERAL_HID_INDICATORS)
+    k_work_cancel_delayable(&slot->sub_chain_retry_work);
+    slot->sub_chain_pending = NULL;
+    slot->sub_chain_index = 0;
+    slot->sub_chain_retries = 0;
 
     return 0;
 }
@@ -262,6 +277,9 @@ static void notify_status_work_cb(struct k_work *_work) { notify_transport_statu
 
 static K_WORK_DEFINE(notify_status_work, notify_status_work_cb);
 
+static bool split_central_sub_chain_on_unsubscribed(struct bt_conn *conn,
+                                                    struct bt_gatt_subscribe_params *params);
+
 #if ZMK_KEYMAP_HAS_SENSORS
 
 static uint8_t split_central_sensor_notify_func(struct bt_conn *conn,
@@ -269,7 +287,9 @@ static uint8_t split_central_sensor_notify_func(struct bt_conn *conn,
                                                 const void *data, uint16_t length) {
     if (!data) {
         LOG_DBG("[UNSUBSCRIBED]");
-        params->value_handle = 0U;
+        if (!split_central_sub_chain_on_unsubscribed(conn, params)) {
+            params->value_handle = 0U;
+        }
         return BT_GATT_ITER_STOP;
     }
 
@@ -308,7 +328,9 @@ static uint8_t peripheral_input_event_notify_cb(struct bt_conn *conn,
                                                 const void *data, uint16_t length) {
     if (!data) {
         LOG_DBG("[UNSUBSCRIBED]");
-        params->value_handle = 0U;
+        if (!split_central_sub_chain_on_unsubscribed(conn, params)) {
+            params->value_handle = 0U;
+        }
         return BT_GATT_ITER_STOP;
     }
 
@@ -358,7 +380,9 @@ static uint8_t split_central_notify_func(struct bt_conn *conn,
 
     if (!data) {
         LOG_DBG("[UNSUBSCRIBED]");
-        params->value_handle = 0U;
+        if (!split_central_sub_chain_on_unsubscribed(conn, params)) {
+            params->value_handle = 0U;
+        }
         return BT_GATT_ITER_STOP;
     }
 
@@ -405,7 +429,9 @@ static uint8_t split_central_battery_level_notify_func(struct bt_conn *conn,
 
     if (!data) {
         LOG_DBG("[UNSUBSCRIBED]");
-        params->value_handle = 0U;
+        if (!split_central_sub_chain_on_unsubscribed(conn, params)) {
+            params->value_handle = 0U;
+        }
         return BT_GATT_ITER_STOP;
     }
 
@@ -542,10 +568,189 @@ static void update_peripherals_selected_physical_layout(struct k_work *_work) {
 K_WORK_DEFINE(update_peripherals_selected_layouts_work,
               update_peripherals_selected_physical_layout);
 
+// GATT callbacks allocate ATT PDUs with K_NO_WAIT, so a drained pool fails with -ENOMEM.
+#define SPLIT_CENTRAL_RETRY_MS 20
+#define SPLIT_CENTRAL_MAX_RETRIES 25 // 25 x 20ms = 500ms
+
+// Not the system workqueue: here a GATT request waits for ATT buffers instead of failing.
+extern struct k_work_q split_central_split_run_q;
+
+static void split_central_sub_chain_next(struct bt_conn *conn, struct peripheral_slot *slot);
+
+static struct bt_gatt_subscribe_params *split_central_sub_chain_entry(struct peripheral_slot *slot,
+                                                                      uint8_t index) {
+    struct bt_gatt_subscribe_params *chain[] = {
+        &slot->subscribe_params,
+#if ZMK_KEYMAP_HAS_SENSORS
+        &slot->sensor_subscribe_params,
+#endif /* ZMK_KEYMAP_HAS_SENSORS */
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING)
+        &slot->batt_lvl_subscribe_params,
+#endif /* IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING) */
+    };
+
+    if (index < ARRAY_SIZE(chain)) {
+        return chain[index];
+    }
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_SPLIT)
+    index -= ARRAY_SIZE(chain);
+    for (size_t i = 0; i < ARRAY_SIZE(peripheral_input_slots); i++) {
+        struct bt_gatt_subscribe_params *sub = &peripheral_input_slots[i].sub;
+        // notify is set once the CPF descriptor is found; reg is a valid 0 for the first device.
+        if (peripheral_input_slots[i].conn == slot->conn && sub->ccc_handle && sub->notify &&
+            index-- == 0) {
+            return sub;
+        }
+    }
+#endif // IS_ENABLED(CONFIG_ZMK_INPUT_SPLIT)
+
+    return NULL;
+}
+
+static void split_central_sub_chain_finish(struct bt_conn *conn, struct peripheral_slot *slot,
+                                           struct bt_gatt_subscribe_params *params, uint8_t err) {
+    struct bt_conn_info info;
+    if (bt_conn_get_info(conn, &info) == 0 && info.state != BT_CONN_STATE_CONNECTED) {
+        return; // the link is already dropping; releasing the slot resets the chain
+    }
+
+    slot->sub_chain_pending = NULL;
+    slot->sub_chain_index++;
+    slot->sub_chain_retries = 0;
+
+    if (params == &slot->subscribe_params) {
+        if (err) {
+            // A deaf half is worse than a reconnect.
+            LOG_ERR("Position-state subscription failed. Disconnecting to retry. (err %d)", err);
+            bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+            return;
+        }
+        LOG_DBG("Position-state subscription established (peripheral %d)",
+                peripheral_slot_index_for_conn(conn));
+    } else if (err) {
+        LOG_WRN("Subscription failed, continuing without it (err %d)", err);
+    }
+
+    split_central_sub_chain_next(conn, slot);
+}
+
+static void split_central_sub_chain_subscribed_cb(struct bt_conn *conn, uint8_t err,
+                                                  struct bt_gatt_subscribe_params *params) {
+    struct peripheral_slot *slot = peripheral_slot_for_conn(conn);
+    if (slot == NULL) {
+        return;
+    }
+
+    if (slot->sub_chain_pending != params) {
+        // A failed CCC write already scheduled a retry via notify(NULL); end with its real error.
+        if (err && params == split_central_sub_chain_entry(slot, slot->sub_chain_index) &&
+            k_work_delayable_is_pending(&slot->sub_chain_retry_work)) {
+            k_work_cancel_delayable(&slot->sub_chain_retry_work);
+            split_central_sub_chain_finish(conn, slot, params, err);
+        }
+        return; // otherwise a stale completion from a released link
+    }
+
+    split_central_sub_chain_finish(conn, slot, params, err);
+}
+
+// A failed CCC discovery reports only notify(NULL); a failed CCC write also calls back after it.
+static bool split_central_sub_chain_on_unsubscribed(struct bt_conn *conn,
+                                                    struct bt_gatt_subscribe_params *params) {
+    struct peripheral_slot *slot = peripheral_slot_for_conn(conn);
+    if (slot == NULL || slot->sub_chain_pending != params) {
+        return false;
+    }
+
+    slot->sub_chain_pending = NULL;
+    if (slot->sub_chain_retries < SPLIT_CENTRAL_MAX_RETRIES) {
+        slot->sub_chain_retries++;
+        k_work_schedule_for_queue(&split_central_split_run_q, &slot->sub_chain_retry_work,
+                                  K_MSEC(SPLIT_CENTRAL_RETRY_MS));
+        return true;
+    }
+
+    split_central_sub_chain_finish(conn, slot, params, BT_ATT_ERR_UNLIKELY);
+    return false;
+}
+
+static void split_central_sub_chain_next(struct bt_conn *conn, struct peripheral_slot *slot) {
+    struct bt_gatt_subscribe_params *params;
+
+    while ((params = split_central_sub_chain_entry(slot, slot->sub_chain_index)) != NULL) {
+        if (!params->value_handle) {
+            slot->sub_chain_index++; // characteristic absent on this peripheral
+            continue;
+        }
+
+        params->subscribe = split_central_sub_chain_subscribed_cb;
+        slot->sub_chain_pending = params;
+        int err = split_central_subscribe(conn, params);
+        if (slot->conn != conn) {
+            return; // link released while the request waited for an ATT slot
+        }
+        if (err == 0) {
+            return; // the completion continues the chain
+        }
+
+        slot->sub_chain_pending = NULL;
+        if (err == -ENOMEM && slot->sub_chain_retries < SPLIT_CENTRAL_MAX_RETRIES) {
+            slot->sub_chain_retries++;
+            k_work_schedule_for_queue(&split_central_split_run_q, &slot->sub_chain_retry_work,
+                                      K_MSEC(SPLIT_CENTRAL_RETRY_MS));
+            return;
+        }
+        if (err == -ENOTCONN) {
+            return;
+        }
+
+        split_central_sub_chain_finish(conn, slot, params,
+                                       err == -EALREADY ? 0 : BT_ATT_ERR_UNLIKELY);
+        return;
+    }
+
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING)
+    if (slot->batt_lvl_subscribe_params.value_handle) {
+        bt_gatt_read(conn, &slot->batt_lvl_read_params);
+    }
+#endif /* IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING) */
+}
+
+static void split_central_sub_chain_retry_cb(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct peripheral_slot *slot =
+        CONTAINER_OF(dwork, struct peripheral_slot, sub_chain_retry_work);
+
+    struct bt_conn *conn = slot->conn;
+    if (slot->state != PERIPHERAL_SLOT_STATE_CONNECTED || conn == NULL) {
+        return;
+    }
+
+    // Held across a request that may block, so a release mid-wait cannot free it.
+    conn = bt_conn_ref(conn);
+    if (conn == NULL) {
+        return; // released between the check and the ref
+    }
+    split_central_sub_chain_next(conn, slot);
+    bt_conn_unref(conn);
+}
+
+static void split_central_flush_subscriptions(struct bt_conn *conn, struct peripheral_slot *slot) {
+    slot->sub_chain_pending = NULL;
+    slot->sub_chain_index = 0;
+    slot->sub_chain_retries = 0;
+    split_central_sub_chain_next(conn, slot);
+}
+
 static uint8_t split_central_chrc_discovery_func(struct bt_conn *conn,
                                                  const struct bt_gatt_attr *attr,
                                                  struct bt_gatt_discover_params *params) {
     if (!attr) {
+        struct peripheral_slot *done_slot = peripheral_slot_for_conn(conn);
+        if (done_slot != NULL) {
+            split_central_flush_subscriptions(conn, done_slot);
+        }
         LOG_DBG("Discover complete");
         return BT_GATT_ITER_STOP;
     }
@@ -574,7 +779,6 @@ static uint8_t split_central_chrc_discovery_func(struct bt_conn *conn,
             slot->subscribe_params.value_handle = bt_gatt_attr_value_handle(attr);
             slot->subscribe_params.notify = split_central_notify_func;
             slot->subscribe_params.value = BT_GATT_CCC_NOTIFY;
-            split_central_subscribe(conn, &slot->subscribe_params);
 #if ZMK_KEYMAP_HAS_SENSORS
         } else if (bt_uuid_cmp(chrc_uuid,
                                BT_UUID_DECLARE_128(ZMK_SPLIT_BT_CHAR_SENSOR_STATE_UUID)) == 0) {
@@ -587,7 +791,6 @@ static uint8_t split_central_chrc_discovery_func(struct bt_conn *conn,
             slot->sensor_subscribe_params.value_handle = bt_gatt_attr_value_handle(attr);
             slot->sensor_subscribe_params.notify = split_central_sensor_notify_func;
             slot->sensor_subscribe_params.value = BT_GATT_CCC_NOTIFY;
-            split_central_subscribe(conn, &slot->sensor_subscribe_params);
 #endif /* ZMK_KEYMAP_HAS_SENSORS */
 #if IS_ENABLED(CONFIG_ZMK_INPUT_SPLIT)
         } else if (bt_uuid_cmp(chrc_uuid, BT_UUID_DECLARE_128(ZMK_SPLIT_BT_INPUT_EVENT_UUID)) ==
@@ -636,13 +839,11 @@ static uint8_t split_central_chrc_discovery_func(struct bt_conn *conn,
             slot->batt_lvl_subscribe_params.value_handle = bt_gatt_attr_value_handle(attr);
             slot->batt_lvl_subscribe_params.notify = split_central_battery_level_notify_func;
             slot->batt_lvl_subscribe_params.value = BT_GATT_CCC_NOTIFY;
-            split_central_subscribe(conn, &slot->batt_lvl_subscribe_params);
 
             slot->batt_lvl_read_params.func = split_central_battery_level_read_func;
             slot->batt_lvl_read_params.handle_count = 1;
             slot->batt_lvl_read_params.single.handle = bt_gatt_attr_value_handle(attr);
             slot->batt_lvl_read_params.single.offset = 0;
-            bt_gatt_read(conn, &slot->batt_lvl_read_params);
 #endif /* IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING) */
         }
         break;
@@ -678,10 +879,6 @@ static uint8_t split_central_chrc_discovery_func(struct bt_conn *conn,
                 input_slot->reg = cpf->description;
                 input_slot->sub.notify = peripheral_input_event_notify_cb;
                 input_slot->sub.value = BT_GATT_CCC_NOTIFY;
-                int err = split_central_subscribe(conn, &input_slot->sub);
-                if (err < 0) {
-                    LOG_WRN("Failed to subscribe to input notifications %d", err);
-                }
             }
 
             slot->discover_params.uuid = NULL;
@@ -714,7 +911,11 @@ static uint8_t split_central_chrc_discovery_func(struct bt_conn *conn,
     }
 #endif // IS_ENABLED(CONFIG_ZMK_INPUT_SPLIT)
 
-    return subscribed ? BT_GATT_ITER_STOP : BT_GATT_ITER_CONTINUE;
+    if (subscribed) {
+        split_central_flush_subscriptions(conn, slot);
+        return BT_GATT_ITER_STOP;
+    }
+    return BT_GATT_ITER_CONTINUE;
 }
 
 static uint8_t split_central_service_discovery_func(struct bt_conn *conn,
@@ -1153,6 +1354,10 @@ static int zmk_split_bt_central_init(void) {
                        K_THREAD_STACK_SIZEOF(split_central_split_run_q_stack),
                        CONFIG_ZMK_BLE_THREAD_PRIORITY, NULL);
     bt_conn_cb_register(&conn_callbacks);
+    for (int i = 0; i < ZMK_SPLIT_BLE_PERIPHERAL_COUNT; i++) {
+        k_work_init_delayable(&peripherals[i].sub_chain_retry_work,
+                              split_central_sub_chain_retry_cb);
+    }
 
 #if IS_ENABLED(CONFIG_SETTINGS)
     settings_register(&ble_central_settings_handler);

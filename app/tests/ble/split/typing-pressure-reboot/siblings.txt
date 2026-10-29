@@ -1,0 +1,4 @@
+./ble_test_central.exe -d=2 -rs=18
+./tests_ble_split_typing-pressure-reboot_peripheral_la.exe -d=3 -rs=19 -flash=/tmp/zmk_ble_split_typing-pressure-reboot.flash -flash_erase
+./tests_ble_split_typing-pressure-reboot_peripheral_lb.exe -d=4 -rs=19 -flash=/tmp/zmk_ble_split_typing-pressure-reboot.flash -start_offset=14742200 -delay_init
+./tests_ble_split_typing-pressure-reboot_peripheral_r.exe -d=5 -rs=21 -start_offset=29673 -delay_init

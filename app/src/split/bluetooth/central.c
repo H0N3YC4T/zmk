@@ -67,6 +67,8 @@ struct peripheral_slot {
     struct k_work_delayable sub_chain_retry_work;
     uint8_t sub_chain_index;
     uint8_t sub_chain_retries;
+    struct k_work_delayable discovery_retry_work;
+    uint8_t discovery_retries;
 };
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_SPLIT)
@@ -234,6 +236,8 @@ int release_peripheral_slot(int index) {
     slot->sub_chain_pending = NULL;
     slot->sub_chain_index = 0;
     slot->sub_chain_retries = 0;
+    k_work_cancel_delayable(&slot->discovery_retry_work);
+    slot->discovery_retries = 0;
 
     return 0;
 }
@@ -747,9 +751,16 @@ static uint8_t split_central_chrc_discovery_func(struct bt_conn *conn,
                                                  const struct bt_gatt_attr *attr,
                                                  struct bt_gatt_discover_params *params) {
     if (!attr) {
+        // A truncated walk also ends here; every peripheral since 2020 has run-behavior.
         struct peripheral_slot *done_slot = peripheral_slot_for_conn(conn);
         if (done_slot != NULL) {
-            split_central_flush_subscriptions(conn, done_slot);
+            if (params->type == BT_GATT_DISCOVER_CHARACTERISTIC &&
+                (!done_slot->subscribe_params.value_handle || !done_slot->run_behavior_handle)) {
+                LOG_ERR("Discovery of peripheral truncated - disconnecting to retry");
+                bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+            } else {
+                split_central_flush_subscriptions(conn, done_slot);
+            }
         }
         LOG_DBG("Discover complete");
         return BT_GATT_ITER_STOP;
@@ -920,10 +931,65 @@ static uint8_t split_central_chrc_discovery_func(struct bt_conn *conn,
 
 static uint8_t split_central_service_discovery_func(struct bt_conn *conn,
                                                     const struct bt_gatt_attr *attr,
+                                                    struct bt_gatt_discover_params *params);
+
+static int split_central_start_discovery(struct bt_conn *conn, struct peripheral_slot *slot) {
+    slot->discover_params.uuid = &split_service_uuid.uuid;
+    slot->discover_params.func = split_central_service_discovery_func;
+    slot->discover_params.start_handle = 0x0001;
+    slot->discover_params.end_handle = 0xffff;
+    slot->discover_params.type = BT_GATT_DISCOVER_PRIMARY;
+
+    return bt_gatt_discover(conn, &slot->discover_params);
+}
+
+// A discovery that never starts or never finds the split service leaves the half deaf.
+static void split_central_retry_discovery(struct bt_conn *conn, struct peripheral_slot *slot,
+                                          int err) {
+    if (slot->discovery_retries < SPLIT_CENTRAL_MAX_RETRIES) {
+        slot->discovery_retries++;
+        LOG_WRN("Discovery failed, retrying (err %d)", err);
+        k_work_schedule_for_queue(&split_central_split_run_q, &slot->discovery_retry_work,
+                                  K_MSEC(SPLIT_CENTRAL_RETRY_MS));
+        return;
+    }
+
+    LOG_ERR("Discovery failed. Disconnecting to retry. (err %d)", err);
+    bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+}
+
+static void split_central_discovery_retry_cb(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct peripheral_slot *slot =
+        CONTAINER_OF(dwork, struct peripheral_slot, discovery_retry_work);
+
+    struct bt_conn *conn = slot->conn;
+    if (slot->state != PERIPHERAL_SLOT_STATE_CONNECTED || conn == NULL) {
+        return;
+    }
+
+    conn = bt_conn_ref(conn); // see split_central_sub_chain_retry_cb
+    if (conn == NULL) {
+        return;
+    }
+    int err = split_central_start_discovery(conn, slot);
+    if (err && slot->conn == conn) {
+        split_central_retry_discovery(conn, slot, err);
+    }
+    bt_conn_unref(conn);
+}
+
+static uint8_t split_central_service_discovery_func(struct bt_conn *conn,
+                                                    const struct bt_gatt_attr *attr,
                                                     struct bt_gatt_discover_params *params) {
     if (!attr) {
         LOG_DBG("Discover complete");
         (void)memset(params, 0, sizeof(*params));
+        // Ending here means the split service was not found: a truncated discovery.
+        struct peripheral_slot *done_slot = peripheral_slot_for_conn(conn);
+        if (done_slot != NULL) {
+            split_central_retry_discovery(conn, done_slot, -ENOENT);
+        }
         return BT_GATT_ITER_STOP;
     }
 
@@ -949,6 +1015,7 @@ static uint8_t split_central_service_discovery_func(struct bt_conn *conn,
     int err = bt_gatt_discover(conn, &slot->discover_params);
     if (err) {
         LOG_ERR("Failed to start discovering split service characteristics (err %d)", err);
+        split_central_retry_discovery(conn, slot, err);
     }
     return BT_GATT_ITER_STOP;
 }
@@ -965,16 +1032,12 @@ static void split_central_process_connection(struct bt_conn *conn) {
     }
 
     if (!slot->subscribe_params.value_handle) {
-        slot->discover_params.uuid = &split_service_uuid.uuid;
-        slot->discover_params.func = split_central_service_discovery_func;
-        slot->discover_params.start_handle = 0x0001;
-        slot->discover_params.end_handle = 0xffff;
-        slot->discover_params.type = BT_GATT_DISCOVER_PRIMARY;
-
-        err = bt_gatt_discover(slot->conn, &slot->discover_params);
+        slot->discovery_retries = 0;
+        err = split_central_start_discovery(conn, slot);
         if (err) {
+            // No early return: scanning was stopped to connect and must still resume.
             LOG_ERR("Discover failed(err %d)", err);
-            return;
+            split_central_retry_discovery(conn, slot, err);
         }
     }
 
@@ -1357,6 +1420,8 @@ static int zmk_split_bt_central_init(void) {
     for (int i = 0; i < ZMK_SPLIT_BLE_PERIPHERAL_COUNT; i++) {
         k_work_init_delayable(&peripherals[i].sub_chain_retry_work,
                               split_central_sub_chain_retry_cb);
+        k_work_init_delayable(&peripherals[i].discovery_retry_work,
+                              split_central_discovery_retry_cb);
     }
 
 #if IS_ENABLED(CONFIG_SETTINGS)

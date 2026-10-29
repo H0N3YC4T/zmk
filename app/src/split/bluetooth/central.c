@@ -908,12 +908,13 @@ static int start_scanning(void) {
     }
 
     // Start scanning otherwise.
-    is_scanning = true;
     int err = bt_le_scan_start(BT_LE_SCAN_PASSIVE, split_central_device_found);
-    if (err < 0) {
+    if (err < 0 && err != -EALREADY) {
         LOG_ERR("Scanning failed to start (err %d)", err);
         return err;
     }
+    // Set only on success: left true after a failure, every later start is a no-op.
+    is_scanning = true;
 
     LOG_DBG("Scanning successfully started");
     return 0;

@@ -1,0 +1,5 @@
+./ble_test_central.exe -d=2 -rs=18
+./tests_ble_split_both-halves-reboot_peripheral_la.exe -d=3 -rs=3 -flash=/tmp/zmk_ble_split_both-halves-reboot-l.flash -flash_erase
+./tests_ble_split_both-halves-reboot_peripheral_ra.exe -d=4 -rs=4 -flash=/tmp/zmk_ble_split_both-halves-reboot-r.flash -flash_erase
+./tests_ble_split_both-halves-reboot_peripheral_lb.exe -d=5 -rs=3 -flash=/tmp/zmk_ble_split_both-halves-reboot-l.flash -start_offset=14761766 -delay_init
+./tests_ble_split_both-halves-reboot_peripheral_rb.exe -d=6 -rs=4 -flash=/tmp/zmk_ble_split_both-halves-reboot-r.flash -start_offset=14756183 -delay_init

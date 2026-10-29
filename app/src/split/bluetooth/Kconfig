@@ -33,8 +33,8 @@ config ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS
 menuconfig ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING
     bool "Fetch Peripheral Battery Level Info"
     help
-      Adds internal support for fetching the battery levels from peripherals
-      and generating events in the ZMK eventing system.
+      Adds internal support for fetching the battery levels and charging
+      state from peripherals and generating events in the ZMK eventing system.
 
 if ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING
 

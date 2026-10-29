@@ -11,6 +11,7 @@ central [SUBSCRIBED]
 central Position-state subscription established (peripheral 0)
 central [SUBSCRIBED]
 central [SUBSCRIBED]
+central [SUBSCRIBED]
 central Battery level: 100
 profile 0 <dbg> ble_central: pairing_complete: Pairing complete
 profile 0 <dbg> ble_central: discover_conn: [Discovery started for conn]
@@ -23,6 +24,7 @@ profile 0 <dbg> ble_central: discover_func: [ATTRIBUTE] handle 37
 profile 0 <dbg> ble_central: discover_func: [ATTRIBUTE] handle 39
 profile 0 <dbg> ble_central: discover_func: [CONSUMER SUBSCRIBED]
 central Position-state subscription established (peripheral 1)
+central [SUBSCRIBED]
 central [SUBSCRIBED]
 central [SUBSCRIBED]
 central Battery level: 100
